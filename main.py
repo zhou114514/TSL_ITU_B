@@ -1,10 +1,16 @@
 """
 TSL-ITU-B 程控激光器控制软件  (PyQt5)
+
+状态监控策略：
+  - 连接后启动后台监听线程，持续读取串口字节流
+  - 监听线程将所有合法的 6 字节应答包（含面板主动推送）解析后通过信号更新界面
+  - 本地发送指令时仅记录"已发送"日志；界面数值在监听线程收到应答后更新
 """
 
 import csv
 import os
 import sys
+import time
 import threading
 from datetime import datetime
 
@@ -17,13 +23,15 @@ from PyQt5.QtWidgets import (
     QTextEdit, QMessageBox, QSizePolicy,
 )
 
-from TSL_ITU_B import TSL_ITU_B
+from TSL_ITU_B import TSL_ITU_B, CHANNEL_ADDR, POWER_ADDR, OUTPUT_ADDR
 
 
 # ── 线程信号桥 ──────────────────────────────────────────────────────────── #
 class _Signals(QObject):
-    log = pyqtSignal(str)
-    output_state_changed = pyqtSignal(bool)
+    log            = pyqtSignal(str)
+    wl_updated     = pyqtSignal(str)   # 波长显示文本
+    pw_updated     = pyqtSignal(str)   # 功率显示文本
+    output_updated = pyqtSignal(bool)  # 输出开关状态
 
 
 def load_wavelength_table():
@@ -50,6 +58,10 @@ def load_wavelength_table():
     return wl_list, table
 
 
+def build_chn_to_wl(wl_table: dict[str, int]) -> dict[int, str]:
+    return {chn: wl for wl, chn in wl_table.items()}
+
+
 class MainWindow(QMainWindow):
     QUICK_WL = ["1540.56", "1563.05"]
 
@@ -60,18 +72,27 @@ class MainWindow(QMainWindow):
 
         self.device: TSL_ITU_B | None = None
         self.output_on = False
+        self._stop_listener = threading.Event()
 
         self._sig = _Signals()
         self._sig.log.connect(self._append_log)
-        self._sig.output_state_changed.connect(self._update_output_button)
+        self._sig.wl_updated.connect(self.disp_wl.setText if False else lambda t: None)
+        self._sig.pw_updated.connect(self.disp_pw.setText if False else lambda t: None)
+        self._sig.output_updated.connect(self._on_output_updated)
 
         try:
             self.wl_list, self.wl_table = load_wavelength_table()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法加载波长表：{e}")
             self.wl_list, self.wl_table = [], {}
+        self.chn_to_wl = build_chn_to_wl(self.wl_table)
 
         self._build_ui()
+
+        # 信号在 UI 构建完成后才能绑定到真实控件
+        self._sig.wl_updated.connect(self.disp_wl.setText)
+        self._sig.pw_updated.connect(self.disp_pw.setText)
+
         self._set_controls_enabled(False)
 
     # ------------------------------------------------------------------ #
@@ -127,6 +148,40 @@ class MainWindow(QMainWindow):
 
         self._refresh_ports()
         body_layout.addWidget(conn_group)
+
+        # ── 当前状态显示区 ────────────────────────────────────────────── #
+        info_group = QGroupBox("当前状态")
+        info_layout = QHBoxLayout(info_group)
+        info_layout.setSpacing(16)
+
+        info_layout.addWidget(QLabel("当前波长:"))
+        self.disp_wl = QLineEdit("—")
+        self.disp_wl.setReadOnly(True)
+        self.disp_wl.setFixedWidth(110)
+        self.disp_wl.setAlignment(Qt.AlignCenter)
+        self.disp_wl.setStyleSheet(
+            "QLineEdit { background:#f0f4f8; color:#1a3a5c; font-weight:bold;"
+            " border:1px solid #b0bec5; border-radius:3px; padding:2px; }"
+        )
+        info_layout.addWidget(self.disp_wl)
+        info_layout.addWidget(QLabel("nm"))
+
+        info_layout.addSpacing(20)
+
+        info_layout.addWidget(QLabel("当前功率:"))
+        self.disp_pw = QLineEdit("—")
+        self.disp_pw.setReadOnly(True)
+        self.disp_pw.setFixedWidth(90)
+        self.disp_pw.setAlignment(Qt.AlignCenter)
+        self.disp_pw.setStyleSheet(
+            "QLineEdit { background:#f0f4f8; color:#1a3a5c; font-weight:bold;"
+            " border:1px solid #b0bec5; border-radius:3px; padding:2px; }"
+        )
+        info_layout.addWidget(self.disp_pw)
+        info_layout.addWidget(QLabel("dBm"))
+        info_layout.addStretch()
+
+        body_layout.addWidget(info_group)
 
         # ── 波长设置区 ────────────────────────────────────────────────── #
         wl_group = QGroupBox("波长设置")
@@ -240,28 +295,147 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color:green; font-weight:bold;")
             self.btn_connect.setText("断开")
             self._set_controls_enabled(True)
-            self._log(f"已连接到 {port}")
+            self._log(f"已连接到 {port}，正在读取初始状态…")
+            # 先查询初始状态，查询完成后在同一线程内进入监听循环
+            self._stop_listener.clear()
+            t = threading.Thread(target=self._init_then_listen, daemon=True)
+            t.start()
         except Exception as e:
             self.device = None
             QMessageBox.critical(self, "连接失败", str(e))
             self._log(f"连接失败: {e}")
 
     def _disconnect(self):
+        # 通知监听线程退出，关闭串口（read 会立刻抛出异常退出循环）
+        self._stop_listener.set()
         if self.device:
             try:
                 if self.output_on:
-                    self.device.set_output(False)
-                    self.output_on = False
+                    self.device.cmd_output(False)
                 self.device.disconnect()
             except Exception:
                 pass
             self.device = None
+        self.output_on = False
         self.status_label.setText("未连接")
         self.status_label.setStyleSheet("color:red; font-weight:bold;")
         self.btn_connect.setText("连接")
         self._set_controls_enabled(False)
-        self._update_output_button(False)
+        self._apply_output_style(False)
+        self.disp_wl.setText("—")
+        self.disp_pw.setText("—")
         self._log("已断开连接")
+
+    # ------------------------------------------------------------------ #
+    #  初始查询 + 监听线程                                                   #
+    # ------------------------------------------------------------------ #
+    def _init_then_listen(self):
+        """
+        连接后在后台线程中依次查询通道、功率、输出状态，
+        完成后无缝衔接进入 _listener_thread 监听循环。
+        串口读权始终在同一线程，不存在竞争。
+        """
+        if self.device is None:
+            return
+
+        # ── 查询当前波长 ──────────────────────────────────────────────── #
+        try:
+            chn = self.device.get_channel()
+            if chn is not None:
+                wl = self.chn_to_wl.get(chn, f"通道 {chn}")
+                self._sig.wl_updated.emit(wl)
+                self._sig.log.emit(self._ts(f"初始波长: {wl} nm  (通道 {chn})"))
+            else:
+                self._sig.log.emit(self._ts("初始波长查询无应答"))
+        except Exception as e:
+            self._sig.log.emit(self._ts(f"初始波长查询异常: {e}"))
+        time.sleep(0.1)
+
+        # ── 查询当前功率 ──────────────────────────────────────────────── #
+        try:
+            pw = self.device.get_power()
+            if pw is not None:
+                self._sig.pw_updated.emit(f"{pw:.2f}")
+                self._sig.log.emit(self._ts(f"初始功率: {pw:.2f} dBm"))
+            else:
+                self._sig.log.emit(self._ts("初始功率查询无应答"))
+        except Exception as e:
+            self._sig.log.emit(self._ts(f"初始功率查询异常: {e}"))
+        time.sleep(0.1)
+
+        # ── 查询当前输出状态 ──────────────────────────────────────────── #
+        try:
+            out = self.device.get_output()
+            if out is not None:
+                self._sig.output_updated.emit(out)
+                self._sig.log.emit(
+                    self._ts(f"初始输出状态: {'开启' if out else '关闭'}")
+                )
+            else:
+                self._sig.log.emit(self._ts("初始输出状态查询无应答"))
+        except Exception as e:
+            self._sig.log.emit(self._ts(f"初始输出状态查询异常: {e}"))
+        time.sleep(0.1)
+        self._sig.log.emit(self._ts("初始状态读取完成，进入串口监听"))
+        # 直接调用（不开新线程），继续在本线程中运行监听循环
+        self._listener_thread()
+
+    # ------------------------------------------------------------------ #
+    #  串口监听线程                                                          #
+    # ------------------------------------------------------------------ #
+    def _listener_thread(self):
+        """
+        持续从串口读取字节，拼装成 6 字节数据包后解析。
+        支持应答包（来自本机指令）和设备主动推送（面板操作）。
+        当 _stop_listener 被置位或串口关闭时自动退出。
+        """
+        ser = self.device.ser
+        buf = bytearray()
+
+        while not self._stop_listener.is_set():
+            try:
+                byte = ser.read(1)
+            except Exception:
+                break
+
+            if not byte:
+                continue
+
+            buf += byte
+
+            # 尝试从缓冲区中提取完整的合法数据包
+            while len(buf) >= 6:
+                # 应答包首字节固定为 0x01 0x01
+                if buf[0] == 0x01 and buf[1] == 0x01:
+                    packet = bytes(buf[:6])
+                    if self.device and self.device.check_data(packet):
+                        self._parse_packet(packet)
+                        buf = buf[6:]
+                    else:
+                        # 校验失败，丢弃第一个字节后重新对齐
+                        buf = buf[1:]
+                else:
+                    buf = buf[1:]
+
+    def _parse_packet(self, packet: bytes):
+        """解析合法的 6 字节应答包并通过信号更新界面"""
+        addr  = packet[2]
+        value = int.from_bytes(packet[3:5], "big")
+
+        if addr == CHANNEL_ADDR:
+            wl = self.chn_to_wl.get(value, f"通道 {value}")
+            self._sig.wl_updated.emit(wl)
+            self._sig.log.emit(self._ts(f"波长更新: {wl} nm  (通道 {value})"))
+
+        elif addr == POWER_ADDR:
+            power = value / 100
+            self._sig.pw_updated.emit(f"{power:.2f}")
+            self._sig.log.emit(self._ts(f"功率更新: {power:.2f} dBm"))
+
+        elif addr == OUTPUT_ADDR:
+            on = (value == 0x0101)
+            self._sig.output_updated.emit(on)
+            self._sig.log.emit(self._ts("激光输出已开启" if on else "激光输出已关闭"))
 
     # ------------------------------------------------------------------ #
     #  波长控制                                                             #
@@ -275,7 +449,7 @@ class MainWindow(QMainWindow):
         if chn is None:
             QMessageBox.critical(self, "错误", f"未找到波长 {wl} 对应的通道号")
             return
-        self._run_in_thread(self._do_set_channel, wl, chn)
+        self._run_in_thread(self._do_send_channel, wl, chn)
 
     def _quick_set_wavelength(self, wl: str):
         chn = self.wl_table.get(wl)
@@ -285,17 +459,14 @@ class MainWindow(QMainWindow):
         idx = self.wl_combo.findText(wl)
         if idx >= 0:
             self.wl_combo.setCurrentIndex(idx)
-        self._run_in_thread(self._do_set_channel, wl, chn)
+        self._run_in_thread(self._do_send_channel, wl, chn)
 
-    def _do_set_channel(self, wl: str, chn: int):
+    def _do_send_channel(self, wl: str, chn: int):
         try:
-            ok = self.device.set_channel(chn)
-            if ok:
-                self._log(f"波长设置成功: {wl} nm  (通道 {chn})")
-            else:
-                self._log(f"波长设置失败: {wl} nm  (通道 {chn})")
+            self.device.cmd_channel(chn)
+            self._sig.log.emit(self._ts(f"已发送波长设置指令: {wl} nm  (通道 {chn})"))
         except Exception as e:
-            self._log(f"波长设置异常: {e}")
+            self._sig.log.emit(self._ts(f"波长设置异常: {e}"))
 
     # ------------------------------------------------------------------ #
     #  功率控制                                                             #
@@ -310,39 +481,35 @@ class MainWindow(QMainWindow):
         if power < 7 or power > 13:
             QMessageBox.warning(self, "提示", "功率范围为 7 ~ 13 dBm")
             return
-        self._run_in_thread(self._do_set_power, power)
+        self._run_in_thread(self._do_send_power, power)
 
-    def _do_set_power(self, power: float):
+    def _do_send_power(self, power: float):
         try:
-            ok = self.device.set_power(power)
-            if ok:
-                self._log(f"功率设置成功: {power:.2f} dBm")
-            else:
-                self._log(f"功率设置失败: {power:.2f} dBm")
+            self.device.cmd_power(power)
+            self._sig.log.emit(self._ts(f"已发送功率设置指令: {power:.2f} dBm"))
         except Exception as e:
-            self._log(f"功率设置异常: {e}")
+            self._sig.log.emit(self._ts(f"功率设置异常: {e}"))
 
     # ------------------------------------------------------------------ #
     #  输出控制                                                             #
     # ------------------------------------------------------------------ #
     def _toggle_output(self):
-        self._run_in_thread(self._do_toggle_output)
+        self._run_in_thread(self._do_send_output)
 
-    def _do_toggle_output(self):
+    def _do_send_output(self):
         try:
             target = not self.output_on
-            ok = self.device.set_output(target)
-            if ok:
-                self.output_on = target
-                self._sig.output_state_changed.emit(target)
-                self._log("激光输出已开启" if target else "激光输出已关闭")
-            else:
-                self._log("输出控制指令未收到应答")
+            self.device.cmd_output(target)
+            self._sig.log.emit(
+                self._ts(f"已发送{'开启' if target else '关闭'}输出指令")
+            )
         except Exception as e:
-            self._log(f"输出控制异常: {e}")
+            self._sig.log.emit(self._ts(f"输出控制异常: {e}"))
 
-    def _update_output_button(self, state: bool):
-        self._apply_output_style(state)
+    def _on_output_updated(self, on: bool):
+        """监听线程收到输出状态变化时调用（主线程）"""
+        self.output_on = on
+        self._apply_output_style(on)
 
     def _apply_output_style(self, on: bool):
         if on:
@@ -376,9 +543,11 @@ class MainWindow(QMainWindow):
         t = threading.Thread(target=func, args=args, daemon=True)
         t.start()
 
+    def _ts(self, msg: str) -> str:
+        return f"[{datetime.now().strftime('%H:%M:%S')}]  {msg}"
+
     def _log(self, msg: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self._sig.log.emit(f"[{ts}]  {msg}")
+        self._sig.log.emit(self._ts(msg))
 
     def _append_log(self, line: str):
         self.log_edit.append(line)

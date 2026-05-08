@@ -83,6 +83,7 @@ class TSL_ITU_B:
         data.append(self.sum_data(data))
         self.send_data(data)
         receive_data = self.receive_data()
+        # print(receive_data.hex())
         if self.check_data(receive_data):
             return int.from_bytes(receive_data[3:5], 'big')
         else:
@@ -104,6 +105,7 @@ class TSL_ITU_B:
         data.append(self.sum_data(data))
         self.send_data(data)
         receive_data = self.receive_data()
+        # print(receive_data.hex())
         if self.check_data(receive_data):
             return int.from_bytes(receive_data[3:5], 'big') / 100
         else:
@@ -129,16 +131,46 @@ class TSL_ITU_B:
         data.append(self.sum_data(data))
         self.send_data(data)
         receive_data = self.receive_data()
+        # print(receive_data.hex())
         if self.check_data(receive_data):
             return True if receive_data[3:5] == b'\x01\x01' else False
         else:
             return None
 
+    # ── 仅发送指令（不读取应答，由外部监听线程统一接收） ────────────────── #
+
+    def cmd_channel(self, channel: int) -> None:
+        """发送设置通道指令，不等待应答"""
+        if channel < 0 or channel > 96:
+            raise ValueError("Channel must be between 0 and 96")
+        data = [*WRITE_HEAD, CHANNEL_ADDR, *self.cal_data(channel)]
+        data.append(self.sum_data(data))
+        self.send_data(data)
+
+    def cmd_power(self, power: float) -> None:
+        """发送设置功率指令，不等待应答"""
+        if power < 7 or power > 13:
+            raise ValueError("Power must be between 7 and 13")
+        data = [*WRITE_HEAD, POWER_ADDR, *self.cal_data(power)]
+        data.append(self.sum_data(data))
+        self.send_data(data)
+
+    def cmd_output(self, output: bool) -> None:
+        """发送设置输出指令，不等待应答"""
+        value = 0x0101 if output else 0x0000
+        data = [*WRITE_HEAD, OUTPUT_ADDR, *self.cal_data(value)]
+        data.append(self.sum_data(data))
+        self.send_data(data)
+
 
 if __name__ == "__main__":
+    import time
     tsl = TSL_ITU_B('COM7')
     # tsl.connect()
     print(tsl.get_channel())
+    time.sleep(0.1)
     print(tsl.get_power())
+    time.sleep(0.1)
     print(tsl.get_output())
+    time.sleep(0.1)
     tsl.disconnect()
