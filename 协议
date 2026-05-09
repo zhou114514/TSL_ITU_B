@@ -1,0 +1,43 @@
+8 程控激光器
+8.1 开激光器
+{"opcode":"LaserON", "parameter":"" }
+响应
+{"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
+
+8.2 关激光器
+{"opcode":"LaserOFF", "parameter":"" }
+响应
+{"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
+
+8.3 调整波长
+{"opcode":"SetWavelength", "parameter":{"Wavelength": "1540/1563"}}
+响应
+{"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
+
+8.4 获取波长
+{"opcode":"GetWavelength", "parameter":"" }
+响应
+{"IsSuccessful":True/False,"Value":{"Wavelength": 实际值},"ErrorMessage":"Null"}
+
+8.5 调整功率
+{"opcode":"SetPower", "parameter":{"Power": 0.00}}
+响应
+{"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
+
+8.6 获取功率
+{"opcode":"GetPower", "parameter":""}
+响应
+{"IsSuccessful":True/False,"Value":{"Power": 实际值},"ErrorMessage":"Null"}
+
+9.1 连接设备
+{"opcode":"ConnectDevice", "parameter":"Null"}
+响应
+{"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
+
+9.2 检查版本号
+{"opcode":"check", "parameter":"Null"}
+响应
+{"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
+
+
+

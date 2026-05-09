@@ -8,12 +8,14 @@ TSL-ITU-B 程控激光器控制软件  (PyQt5)
 """
 
 import csv
+import json
 import os
 import sys
 import time
 import threading
 from datetime import datetime
 
+from TCPServer import TCPServer
 import serial.tools.list_ports
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QDoubleValidator
@@ -24,6 +26,38 @@ from PyQt5.QtWidgets import (
 )
 
 from TSL_ITU_B import TSL_ITU_B, CHANNEL_ADDR, POWER_ADDR, OUTPUT_ADDR
+
+
+# ── 配置文件 ─────────────────────────────────────────────────────────────── #
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+DEFAULT_CONFIG: dict = {
+    "last_port": "",
+    "tcp_host": "127.0.0.1",
+    "tcp_port": 10009,
+}
+
+
+def load_config() -> dict:
+    """加载配置文件，若文件不存在或解析失败则返回默认值"""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = dict(DEFAULT_CONFIG)
+            cfg.update(data)
+            return cfg
+        except Exception:
+            pass
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict) -> None:
+    """将配置写入文件"""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存配置失败: {e}")
 
 
 # ── 线程信号桥 ──────────────────────────────────────────────────────────── #
@@ -70,6 +104,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("TSL-ITU-B  程控激光器控制")
         self.setFixedWidth(520)
 
+        self.cfg = load_config()
+
         self.device: TSL_ITU_B | None = None
         self.output_on = False
         self._stop_listener = threading.Event()
@@ -94,6 +130,22 @@ class MainWindow(QMainWindow):
         self._sig.pw_updated.connect(self.disp_pw.setText)
 
         self._set_controls_enabled(False)
+
+        # 恢复上次选择的串口
+        last_port = self.cfg.get("last_port", "")
+        if last_port:
+            idx = self.port_combo.findText(last_port)
+            if idx >= 0:
+                self.port_combo.setCurrentIndex(idx)
+
+        # 使用配置中的 IP/端口启动 TCP 服务器
+        tcp_host = self.cfg.get("tcp_host", DEFAULT_CONFIG["tcp_host"])
+        tcp_port = self.cfg.get("tcp_port", DEFAULT_CONFIG["tcp_port"])
+        self.server = TCPServer(address=tcp_host, port=tcp_port)
+        self.server.message_signal.connect(self._on_tcp_message)
+        self.server.start()
+        # self.tcp_status_label.setText(f"运行中 ({tcp_host}:{tcp_port})")
+        # self.tcp_status_label.setStyleSheet("color:green; font-weight:bold;")
 
     # ------------------------------------------------------------------ #
     #  UI 构建                                                              #
@@ -148,6 +200,34 @@ class MainWindow(QMainWindow):
 
         self._refresh_ports()
         body_layout.addWidget(conn_group)
+
+        # # ── 远程控制配置区 ────────────────────────────────────────────── #
+        # tcp_group = QGroupBox("远程控制配置")
+        # tcp_layout = QHBoxLayout(tcp_group)
+        # tcp_layout.setSpacing(8)
+
+        # tcp_layout.addWidget(QLabel("IP:"))
+        # self.tcp_host_edit = QLineEdit(self.cfg.get("tcp_host", DEFAULT_CONFIG["tcp_host"]))
+        # self.tcp_host_edit.setFixedWidth(120)
+        # tcp_layout.addWidget(self.tcp_host_edit)
+
+        # tcp_layout.addWidget(QLabel("端口:"))
+        # self.tcp_port_edit = QLineEdit(str(self.cfg.get("tcp_port", DEFAULT_CONFIG["tcp_port"])))
+        # self.tcp_port_edit.setFixedWidth(65)
+        # tcp_layout.addWidget(self.tcp_port_edit)
+
+        # btn_save_tcp = QPushButton("保存")
+        # btn_save_tcp.setFixedWidth(54)
+        # btn_save_tcp.clicked.connect(self._save_tcp_config)
+        # tcp_layout.addWidget(btn_save_tcp)
+
+        # tcp_layout.addStretch()
+
+        # self.tcp_status_label = QLabel("未启动")
+        # self.tcp_status_label.setStyleSheet("color:gray;")
+        # tcp_layout.addWidget(self.tcp_status_label)
+
+        # body_layout.addWidget(tcp_group)
 
         # ── 当前状态显示区 ────────────────────────────────────────────── #
         info_group = QGroupBox("当前状态")
@@ -291,6 +371,8 @@ class MainWindow(QMainWindow):
             return
         try:
             self.device = TSL_ITU_B(port)
+            self.cfg["last_port"] = port
+            save_config(self.cfg)
             self.status_label.setText("已连接")
             self.status_label.setStyleSheet("color:green; font-weight:bold;")
             self.btn_connect.setText("断开")
@@ -554,6 +636,131 @@ class MainWindow(QMainWindow):
         self.log_edit.verticalScrollBar().setValue(
             self.log_edit.verticalScrollBar().maximum()
         )
+
+    # ------------------------------------------------------------------ #
+    #  TCP 配置保存                                                         #
+    # ------------------------------------------------------------------ #
+    def _save_tcp_config(self):
+        host = self.tcp_host_edit.text().strip()
+        port_text = self.tcp_port_edit.text().strip()
+        try:
+            port = int(port_text)
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "提示", "端口号无效，请输入 1~65535 之间的整数")
+            return
+        self.cfg["tcp_host"] = host
+        self.cfg["tcp_port"] = port
+        save_config(self.cfg)
+        QMessageBox.information(self, "提示", "配置已保存，重启程序后生效")
+
+    # ------------------------------------------------------------------ #
+    #  TCP 远程控制协议处理                                                   #
+    # ------------------------------------------------------------------ #
+    def _on_tcp_message(self, client_socket, message: str):
+        """处理远程控制 TCP 消息，依照协议分发到对应设备操作"""
+        def reply(ok: bool, value=None, error: str = "Null"):
+            self.server.back_signal.emit(client_socket, [ok, value if value is not None else "", error])
+
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError as e:
+            self._log(f"[TCP] JSON 解析错误: {e}  原始数据: {message!r}")
+            reply(False, error=f"JSON解析错误: {e}")
+            return
+
+        opcode = data.get("opcode", "")
+        parameter = data.get("parameter", "")
+        self._log(f"[TCP] 收到指令: {opcode}")
+
+        try:
+            # ── 9.1 连接设备 ──────────────────────────────────────────── #
+            if opcode == "ConnectDevice":
+                if self.device is not None:
+                    reply(True)
+                else:
+                    reply(False, error="设备未连接，请先通过串口连接设备")
+
+            # ── 9.2 检查版本号 ─────────────────────────────────────────── #
+            elif opcode == "check":
+                reply(True)
+
+            # ── 8.1 开激光器 ──────────────────────────────────────────── #
+            elif opcode == "LaserON":
+                if self.device is None:
+                    reply(False, error="设备未连接")
+                    return
+                self.device.cmd_output(True)
+                self._log(f"[TCP] LaserON 执行成功")
+                reply(True)
+
+            # ── 8.2 关激光器 ──────────────────────────────────────────── #
+            elif opcode == "LaserOFF":
+                if self.device is None:
+                    reply(False, error="设备未连接")
+                    return
+                self.device.cmd_output(False)
+                self._log(f"[TCP] LaserOFF 执行成功")
+                reply(True)
+
+            # ── 8.3 调整波长 ──────────────────────────────────────────── #
+            elif opcode == "SetWavelength":
+                if self.device is None:
+                    reply(False, error="设备未连接")
+                    return
+                wl = str(parameter.get("Wavelength", "")).strip() if isinstance(parameter, dict) else ""
+                if not wl:
+                    reply(False, error="参数 Wavelength 缺失")
+                    return
+                chn = self.wl_table.get(wl)
+                if chn is None:
+                    reply(False, error=f"未找到波长 {wl} 对应的通道号")
+                    return
+                self.device.cmd_channel(chn)
+                self._log(f"[TCP] SetWavelength {wl} nm (通道 {chn}) 执行成功")
+                reply(True)
+
+            # ── 8.4 获取波长 ──────────────────────────────────────────── #
+            elif opcode == "GetWavelength":
+                if self.device is None:
+                    reply(False, error="设备未连接")
+                    return
+                chn = self.device.get_channel()
+                wl = self.chn_to_wl.get(chn, f"通道{chn}") if chn is not None else ""
+                self._log(f"[TCP] GetWavelength 返回: {wl}")
+                reply(True, value={"Wavelength": wl})
+
+            # ── 8.5 调整功率 ──────────────────────────────────────────── #
+            elif opcode == "SetPower":
+                if self.device is None:
+                    reply(False, error="设备未连接")
+                    return
+                try:
+                    power = float(parameter.get("Power", 0)) if isinstance(parameter, dict) else float(parameter)
+                except (TypeError, ValueError):
+                    reply(False, error="参数 Power 无效")
+                    return
+                self.device.cmd_power(power)
+                self._log(f"[TCP] SetPower {power:.2f} dBm 执行成功")
+                reply(True)
+
+            # ── 8.6 获取功率 ──────────────────────────────────────────── #
+            elif opcode == "GetPower":
+                if self.device is None:
+                    reply(False, error="设备未连接")
+                    return
+                pw = self.device.get_power()
+                self._log(f"[TCP] GetPower 返回: {pw}")
+                reply(True, value={"Power": pw})
+
+            else:
+                self._log(f"[TCP] 未知指令: {opcode}")
+                reply(False, error=f"未知指令: {opcode}")
+
+        except Exception as e:
+            self._log(f"[TCP] 执行指令 {opcode} 异常: {e}")
+            reply(False, error=str(e))
 
     def closeEvent(self, event):
         self._disconnect()
