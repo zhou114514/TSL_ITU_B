@@ -1,36 +1,41 @@
 8 程控激光器
+
+所有指令的 parameter 字段中均可携带 "device" 以指定目标设备：
+    "device": "Transmitter"   → 发射端（默认，省略时亦路由到发射端）
+    "device": "CCD"           → CCD 端
+
 8.1 开激光器
-{"opcode":"LaserON", "parameter":"" }
+{"opcode":"LaserON", "parameter":{"device":"Transmitter"}}
 响应
 {"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
 
 8.2 关激光器
-{"opcode":"LaserOFF", "parameter":"" }
+{"opcode":"LaserOFF", "parameter":{"device":"Transmitter"}}
 响应
 {"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
 
 8.3 调整波长
-{"opcode":"SetWavelength", "parameter":{"Wavelength": "1540/1563"}}
+{"opcode":"SetWavelength", "parameter":{"Wavelength":"1540/1563", "device":"Transmitter"}}
 响应
 {"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
 
 8.4 获取波长
-{"opcode":"GetWavelength", "parameter":"" }
+{"opcode":"GetWavelength", "parameter":{"device":"Transmitter"}}
 响应
 {"IsSuccessful":True/False,"Value":{"Wavelength": 实际值},"ErrorMessage":"Null"}
 
 8.5 调整功率
-{"opcode":"SetPower", "parameter":{"Power": 0.00}}
+{"opcode":"SetPower", "parameter":{"Power":0.00, "device":"Transmitter"}}
 响应
 {"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
 
 8.6 获取功率
-{"opcode":"GetPower", "parameter":""}
+{"opcode":"GetPower", "parameter":{"device":"Transmitter"}}
 响应
 {"IsSuccessful":True/False,"Value":{"Power": 实际值},"ErrorMessage":"Null"}
 
 9.1 连接设备
-{"opcode":"ConnectDevice", "parameter":"Null"}
+{"opcode":"ConnectDevice", "parameter":{"device":"Transmitter"}}
 响应
 {"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
 
@@ -38,6 +43,3 @@
 {"opcode":"check", "parameter":"Null"}
 响应
 {"IsSuccessful":True/False,"Value":"","ErrorMessage":"Null"}
-
-
-
