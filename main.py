@@ -33,9 +33,13 @@ from PyQt5.QtWidgets import (
 
 from TSL_ITU_B import TSL_ITU_B, READ_HEAD, CHANNEL_ADDR, POWER_ADDR, OUTPUT_ADDR
 
+if getattr(sys, "frozen", False):
+    SYS_PATH = os.path.dirname(sys.executable)
+else:
+    SYS_PATH = os.path.dirname(os.path.abspath(__file__))
 
 # ── 配置文件 ─────────────────────────────────────────────────────────────── #
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_PATH = os.path.join(SYS_PATH, "config.json")
 DEFAULT_CONFIG: dict = {
     "last_port_tx": "",
     "last_port_ccd": "",
@@ -73,7 +77,7 @@ def save_config(cfg: dict) -> None:
 
 def load_wavelength_table():
     """从 docs 目录读取波长通道对应表，返回 (wl_list, wl_table)"""
-    docs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
+    docs_dir = os.path.join(SYS_PATH, "docs")
     csv_path = None
     for f in os.listdir(docs_dir):
         if f.endswith(".csv"):
@@ -105,6 +109,33 @@ class _Signals(QObject):
     wl_updated     = pyqtSignal(str)   # 波长显示文本
     pw_updated     = pyqtSignal(str)   # 功率显示文本
     output_updated = pyqtSignal(bool)  # 输出开关状态
+
+
+# ── 限高下拉框 ──────────────────────────────────────────────────────────── #
+class ScrollableComboBox(QComboBox):
+    """弹出列表限制最大像素高度，超出部分滚动显示"""
+
+    def __init__(self, max_popup_height=300, parent=None):
+        super().__init__(parent)
+        self._max_popup_height = max_popup_height
+
+    def showPopup(self):
+        super().showPopup()
+        popup = self.view().parent()
+        geo = popup.geometry()
+        if geo.height() <= self._max_popup_height:
+            return
+
+        screen_rect = QApplication.desktop().availableGeometry(self)
+        below = self.mapToGlobal(self.rect().bottomLeft())
+        above = self.mapToGlobal(self.rect().topLeft())
+
+        geo.setHeight(self._max_popup_height)
+        if below.y() + self._max_popup_height <= screen_rect.bottom():
+            geo.moveTopLeft(below)
+        else:
+            geo.moveBottomLeft(above)
+        popup.setGeometry(geo)
 
 
 # ── 单设备控制面板 ──────────────────────────────────────────────────────── #
@@ -238,7 +269,7 @@ class LaserPanel(QWidget):
 
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("波长 (nm):"))
-        self.wl_combo = QComboBox()
+        self.wl_combo = ScrollableComboBox(max_popup_height=300)
         self.wl_combo.addItems(self.wl_list)
         self.wl_combo.setFixedWidth(110)
         row1.addWidget(self.wl_combo)
