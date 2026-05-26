@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
     QTextEdit, QMessageBox, QSizePolicy, QTabWidget,
 )
 
-from TSL_ITU_B import TSL_ITU_B, CHANNEL_ADDR, POWER_ADDR, OUTPUT_ADDR
+from TSL_ITU_B import TSL_ITU_B, READ_HEAD, CHANNEL_ADDR, POWER_ADDR, OUTPUT_ADDR
 
 
 # ── 配置文件 ─────────────────────────────────────────────────────────────── #
@@ -42,6 +42,7 @@ DEFAULT_CONFIG: dict = {
     "tcp_host": "127.0.0.1",
     "tcp_port": 10009,
 }
+VERSION = "1.1.0"
 
 
 def load_config() -> dict:
@@ -133,6 +134,11 @@ class LaserPanel(QWidget):
         self.device: TSL_ITU_B | None = None
         self.output_on = False
         self._stop_listener = threading.Event()
+
+        self._query_lock = threading.Lock()
+        self._pending_addr: int | None = None
+        self._pending_result: bytes | None = None
+        self._pending_event = threading.Event()
 
         self._sig = _Signals()
         self._sig.log.connect(self._append_log)
@@ -444,6 +450,10 @@ class LaserPanel(QWidget):
         addr  = packet[2]
         value = int.from_bytes(packet[3:5], "big")
 
+        if self._pending_addr is not None and addr == self._pending_addr:
+            self._pending_result = packet
+            self._pending_event.set()
+
         if addr == CHANNEL_ADDR:
             wl = self.chn_to_wl.get(value, f"通道 {value}")
             self._sig.wl_updated.emit(wl)
@@ -458,6 +468,47 @@ class LaserPanel(QWidget):
             on = (value == 0x0101)
             self._sig.output_updated.emit(on)
             self._sig.log.emit(self._ts("激光输出已开启" if on else "激光输出已关闭"))
+
+    # ------------------------------------------------------------------ #
+    #  线程安全查询（经由监听线程中转应答）                                        #
+    # ------------------------------------------------------------------ #
+    def query_device(self, addr: int, timeout: float = 2.0) -> bytes | None:
+        """发送查询指令并等待监听线程捕获应答包，避免与监听线程竞争串口读取。"""
+        if self.device is None:
+            return None
+        with self._query_lock:
+            self._pending_event.clear()
+            self._pending_result = None
+            self._pending_addr = addr
+
+            data = [*READ_HEAD, addr, 0, 0]
+            data.append(self.device.sum_data(data))
+            self.device.send_data(data)
+
+            got = self._pending_event.wait(timeout=timeout)
+            result = self._pending_result
+
+            self._pending_addr = None
+            self._pending_result = None
+        return result if got else None
+
+    def get_channel_via_listener(self) -> int | None:
+        packet = self.query_device(CHANNEL_ADDR)
+        if packet and self.device and self.device.check_data(packet):
+            return int.from_bytes(packet[3:5], "big")
+        return None
+
+    def get_power_via_listener(self) -> float | None:
+        packet = self.query_device(POWER_ADDR)
+        if packet and self.device and self.device.check_data(packet):
+            return int.from_bytes(packet[3:5], "big") / 100
+        return None
+
+    def get_output_via_listener(self) -> bool | None:
+        packet = self.query_device(OUTPUT_ADDR)
+        if packet and self.device and self.device.check_data(packet):
+            return packet[3:5] == b"\x01\x01"
+        return None
 
     # ------------------------------------------------------------------ #
     #  波长控制                                                             #
@@ -697,7 +748,7 @@ class MainWindow(QMainWindow):
 
             # ── 9.2 检查版本号 ─────────────────────────────────────────── #
             elif opcode == "check":
-                reply(True)
+                reply(True, value=VERSION)
 
             # ── 8.1 开激光器 ──────────────────────────────────────────── #
             elif opcode == "LaserON":
@@ -723,6 +774,10 @@ class MainWindow(QMainWindow):
                     reply(False, error=f"{panel.label} 未连接")
                     return
                 wl = str(parameter.get("Wavelength", "")).strip() if isinstance(parameter, dict) else ""
+                if wl == "1540":
+                    wl = "1540.56"
+                elif wl == "1563":
+                    wl = "1563.05"
                 if not wl:
                     reply(False, error="参数 Wavelength 缺失")
                     return
@@ -739,7 +794,7 @@ class MainWindow(QMainWindow):
                 if panel.device is None:
                     reply(False, error=f"{panel.label} 未连接")
                     return
-                chn = panel.device.get_channel()
+                chn = panel.get_channel_via_listener()
                 wl = self.chn_to_wl.get(chn, f"通道{chn}") if chn is not None else ""
                 panel._log(f"[TCP] GetWavelength 返回: {wl}")
                 reply(True, value={"Wavelength": wl})
@@ -763,7 +818,7 @@ class MainWindow(QMainWindow):
                 if panel.device is None:
                     reply(False, error=f"{panel.label} 未连接")
                     return
-                pw = panel.device.get_power()
+                pw = panel.get_power_via_listener()
                 panel._log(f"[TCP] GetPower 返回: {pw}")
                 reply(True, value={"Power": pw})
 

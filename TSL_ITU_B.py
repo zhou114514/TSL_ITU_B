@@ -13,6 +13,7 @@ SUM: 校验和 前五字节求和
 """
 
 import serial
+import time
 
 WRITE_HEAD = [0x00, 0x01]
 READ_HEAD = [0x01, 0x00]
@@ -39,7 +40,8 @@ class TSL_ITU_B:
 
     def receive_data(self) -> bytes | None:
         try:
-            return self.ser.read(6)
+            data = self.ser.read(6)
+            return data if len(data) == 6 else None
         except Exception as e:
             print(f"Error receiving data: {e}")
             return None
