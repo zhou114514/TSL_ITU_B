@@ -165,6 +165,7 @@ class LaserPanel(QWidget):
         self.device: TSL_ITU_B | None = None
         self.output_on = False
         self._stop_listener = threading.Event()
+        self._listener_thread_obj: threading.Thread | None = None
 
         self._query_lock = threading.Lock()
         self._pending_addr: int | None = None
@@ -379,6 +380,7 @@ class LaserPanel(QWidget):
             self._log(f"[{self.label}] 已连接到 {port}，正在读取初始状态…")
             self._stop_listener.clear()
             t = threading.Thread(target=self._init_then_listen, daemon=True)
+            self._listener_thread_obj = t
             t.start()
         except Exception as e:
             self.device = None
@@ -387,6 +389,11 @@ class LaserPanel(QWidget):
 
     def _disconnect(self):
         self._stop_listener.set()
+        # 先等待监听线程退出，再关闭串口
+        # 避免 Windows 下 CloseHandle 与 ReadFile 同时操作同一句柄导致死锁
+        if self._listener_thread_obj is not None:
+            self._listener_thread_obj.join(timeout=2.0)
+            self._listener_thread_obj = None
         if self.device:
             try:
                 if self.output_on:
