@@ -1,11 +1,15 @@
 """
-TSL-ITU-B 程控激光器控制软件  (PyQt5) — 双设备版本
+TSL-ITU-B 程控激光器控制软件  (PyQt5) — 多设备可配置版本
 
-支持同时管理两台激光器（发射端 / CCD端），通过选项卡切换操作界面。
-远程控制协议在所有指令中新增 "device" 字段，用于指定目标设备：
-    "Transmitter" → 发射端
-    "CCD"         → CCD 端
-若未携带 "device" 字段，默认路由到发射端。
+通过 config.json 中的 "lasers" 数组动态管理任意数量的激光器，
+每个元素对应一台激光器，至少包含两个字段：
+    tab_name   — 界面选项卡上显示的名称
+    device_id  — 远程控制指令中 "device" 字段对应的标识符
+可选字段：
+    port_cfg_key — 存储上次串口选择的键名（省略时自动生成）
+
+远程控制协议：在所有指令中携带 "device" 字段以指定目标设备；
+若未携带 "device" 字段，默认路由到第一台激光器。
 
 状态监控策略：
   - 连接后启动后台监听线程，持续读取串口字节流
@@ -40,9 +44,15 @@ else:
 
 # ── 配置文件 ─────────────────────────────────────────────────────────────── #
 CONFIG_PATH = os.path.join(SYS_PATH, "config.json")
+
+# 默认激光器列表，兼容旧版双设备配置
+_DEFAULT_LASERS = [
+    {"tab_name": "发射端", "device_id": "Transmitter", "port_cfg_key": "last_port_tx"},
+    {"tab_name": "CCD 端",  "device_id": "CCD",          "port_cfg_key": "last_port_ccd"},
+]
+
 DEFAULT_CONFIG: dict = {
-    "last_port_tx": "",
-    "last_port_ccd": "",
+    "lasers": _DEFAULT_LASERS,
     "tcp_host": "127.0.0.1",
     "tcp_port": 10009,
 }
@@ -57,8 +67,8 @@ def load_config() -> dict:
                 data = json.load(f)
             cfg = dict(DEFAULT_CONFIG)
             cfg.update(data)
-            # 兼容旧版 last_port 字段
-            if "last_port" in data and not cfg["last_port_tx"]:
+            # 兼容旧版 last_port 字段（旧版只有 last_port，无 last_port_tx）
+            if "last_port" in data and not cfg.get("last_port_tx"):
                 cfg["last_port_tx"] = data["last_port"]
             return cfg
         except Exception:
@@ -717,25 +727,23 @@ class MainWindow(QMainWindow):
             "QTabBar::tab:selected { font-weight: bold; color: #1a3a5c; }"
         )
 
-        self.panel_tx = LaserPanel(
-            label="发射端",
-            wl_list=self.wl_list,
-            wl_table=self.wl_table,
-            chn_to_wl=self.chn_to_wl,
-            port_cfg_key="last_port_tx",
-            cfg=self.cfg,
-        )
-        self.panel_ccd = LaserPanel(
-            label="CCD端",
-            wl_list=self.wl_list,
-            wl_table=self.wl_table,
-            chn_to_wl=self.chn_to_wl,
-            port_cfg_key="last_port_ccd",
-            cfg=self.cfg,
-        )
-
-        self.tab_widget.addTab(self.panel_tx,  "发射端")
-        self.tab_widget.addTab(self.panel_ccd, "CCD 端")
+        # 从配置动态创建激光器面板；device_id 大写后作为路由键
+        self.panels: dict[str, LaserPanel] = {}
+        laser_list = self.cfg.get("lasers", _DEFAULT_LASERS)
+        for idx, laser_cfg in enumerate(laser_list):
+            tab_name    = laser_cfg.get("tab_name",    f"激光器 {idx + 1}")
+            device_id   = laser_cfg.get("device_id",   tab_name)
+            port_cfg_key = laser_cfg.get("port_cfg_key", f"last_port_{device_id}")
+            panel = LaserPanel(
+                label=tab_name,
+                wl_list=self.wl_list,
+                wl_table=self.wl_table,
+                chn_to_wl=self.chn_to_wl,
+                port_cfg_key=port_cfg_key,
+                cfg=self.cfg,
+            )
+            self.panels[device_id.upper()] = panel
+            self.tab_widget.addTab(panel, tab_name)
 
         root_layout.addWidget(self.tab_widget)
 
@@ -762,19 +770,16 @@ class MainWindow(QMainWindow):
         opcode    = data.get("opcode", "")
         parameter = data.get("parameter", "")
 
-        # device 字段从 parameter 中读取
+        # device 字段从 parameter 中读取，大写后与 panels 字典的键匹配
         if isinstance(parameter, dict):
             device_field = str(parameter.get("device", "")).strip().upper()
         else:
             device_field = ""
 
-        # 根据 device 字段路由到对应面板
-        if device_field == "CCD":
-            panel = self.panel_ccd
-        else:
-            panel = self.panel_tx
+        # 根据 device 字段路由到对应面板；未指定时默认路由到第一台激光器
+        panel = self.panels.get(device_field) or next(iter(self.panels.values()))
 
-        panel._log(f"[TCP] 收到指令: {opcode}  (device={device_field or 'Transmitter'})")
+        panel._log(f"[TCP] 收到指令: {opcode}  (device={device_field or next(iter(self.panels))})")
 
         try:
             # ── 9.1 连接设备 ──────────────────────────────────────────── #
@@ -869,8 +874,8 @@ class MainWindow(QMainWindow):
             reply(False, error=str(e))
 
     def closeEvent(self, event):
-        self.panel_tx._disconnect()
-        self.panel_ccd._disconnect()
+        for panel in self.panels.values():
+            panel._disconnect()
         event.accept()
 
 
