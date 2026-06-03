@@ -1,7 +1,0 @@
-{
-  "last_port_tx": "COM7",
-  "last_port_ccd": "COM8",
-  "tcp_host": "127.0.0.1",
-  "tcp_port": 10009,
-  "last_port": ""
-}
