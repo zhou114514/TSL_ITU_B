@@ -6,9 +6,6 @@ import threading
 
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer
 import socket
-import time
-import pandas as pd
-import os
 import datetime
 import json
 
