@@ -28,11 +28,12 @@ from datetime import datetime
 from TCPServer import TCPServer
 import serial.tools.list_ports
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QDoubleValidator
+from PyQt5.QtGui import QFont, QDoubleValidator, QIntValidator
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QComboBox, QPushButton, QLineEdit,
     QTextEdit, QMessageBox, QSizePolicy, QTabWidget,
+    QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
 from TSL_ITU_B import TSL_ITU_B, READ_HEAD, CHANNEL_ADDR, POWER_ADDR, OUTPUT_ADDR
@@ -73,7 +74,11 @@ def load_config() -> dict:
             return cfg
         except Exception:
             pass
-    return dict(DEFAULT_CONFIG)
+    else:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        return dict(DEFAULT_CONFIG)
 
 
 def save_config(cfg: dict) -> None:
@@ -676,6 +681,221 @@ class LaserPanel(QWidget):
         )
 
 
+# ── 配置对话框 ───────────────────────────────────────────────────────────── #
+class ConfigDialog(QDialog):
+    """激光器配置对话框"""
+
+    PRESET_DEFAULT = [
+        {"tab_name": "发射端", "device_id": "Transmitter", "port_cfg_key": "last_port_tx"},
+        {"tab_name": "CCD 端",  "device_id": "CCD",          "port_cfg_key": "last_port_ccd"},
+    ]
+    PRESET_REAR_OPTICAL = [
+        {"tab_name": "发射A", "device_id": "A"},
+        {"tab_name": "发射B", "device_id": "B"},
+        {"tab_name": "基准镜", "device_id": "JZJ"},
+        {"tab_name": "接收",   "device_id": "CCD"},
+    ]
+
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle("软件配置")
+        self.setFixedWidth(500)
+        self.setModal(True)
+        self._build_ui()
+        self._load_from_cfg()
+
+    # ------------------------------------------------------------------ #
+    #  UI 构建                                                              #
+    # ------------------------------------------------------------------ #
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        # ── 标题 ──────────────────────────────────────────────────────── #
+        title = QLabel("软件配置")
+        title.setAlignment(Qt.AlignCenter)
+        title.setFixedHeight(40)
+        title.setFont(QFont("微软雅黑", 13, QFont.Bold))
+        title.setStyleSheet(
+            "background:#1a3a5c; color:white; border-radius:3px;"
+        )
+        root.addWidget(title)
+
+        # ── 激光器配置 ────────────────────────────────────────────────── #
+        laser_group = QGroupBox("激光器配置")
+        laser_layout = QVBoxLayout(laser_group)
+        laser_layout.setSpacing(8)
+
+        # 预设按钮行
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("快速预设:"))
+
+        btn_default = QPushButton("默认配置")
+        btn_default.setFixedWidth(100)
+        btn_default.setToolTip("发射端 (Transmitter) + CCD 端 (CCD)")
+        btn_default.clicked.connect(lambda: self._load_preset(self.PRESET_DEFAULT))
+        preset_row.addWidget(btn_default)
+
+        btn_rear = QPushButton("后光路测试")
+        btn_rear.setFixedWidth(100)
+        btn_rear.setToolTip("发射A / 发射B / 基准镜 / 接收，共四台激光器")
+        btn_rear.clicked.connect(lambda: self._load_preset(self.PRESET_REAR_OPTICAL))
+        preset_row.addWidget(btn_rear)
+
+        preset_row.addStretch()
+        laser_layout.addLayout(preset_row)
+
+        # 激光器列表表格
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["选项卡名称", "远程控制 ID", ""])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.table.setColumnWidth(2, 52)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
+        self.table.setStyleSheet(
+            "QTableWidget { border:1px solid #c0c0c0; gridline-color:#e0e0e0; }"
+            "QHeaderView::section { background:#f0f4f8; font-weight:bold;"
+            "  border:none; border-bottom:1px solid #c0c0c0; padding:4px; font-family:微软雅黑; }"
+        )
+        self.table.setFixedHeight(160)
+        laser_layout.addWidget(self.table)
+
+        # 添加行按钮
+        btn_add = QPushButton("＋  添加激光器")
+        btn_add.setFixedHeight(28)
+        btn_add.setStyleSheet(
+            "QPushButton { border:1px dashed #aaa; border-radius:3px; color:#555; font-family:微软雅黑; }"
+            "QPushButton:hover { background:#f0f4f8; border-color:#1a3a5c; color:#1a3a5c; }"
+        )
+        btn_add.clicked.connect(lambda: self._add_row())
+        laser_layout.addWidget(btn_add)
+
+        root.addWidget(laser_group)
+
+        # ── TCP 配置 ──────────────────────────────────────────────────── #
+        tcp_group = QGroupBox("TCP 远程控制")
+        tcp_layout = QHBoxLayout(tcp_group)
+        tcp_layout.setSpacing(8)
+
+        tcp_layout.addWidget(QLabel("监听地址:"))
+        self.host_edit = QLineEdit()
+        self.host_edit.setFixedWidth(140)
+        tcp_layout.addWidget(self.host_edit)
+
+        tcp_layout.addSpacing(16)
+        tcp_layout.addWidget(QLabel("端口:"))
+        self.port_edit = QLineEdit()
+        self.port_edit.setFixedWidth(70)
+        self.port_edit.setValidator(QIntValidator(1, 65535, self))
+        tcp_layout.addWidget(self.port_edit)
+        tcp_layout.addStretch()
+
+        root.addWidget(tcp_group)
+
+        # ── 底部按钮 ──────────────────────────────────────────────────── #
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedSize(88, 32)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_save = QPushButton("保存")
+        btn_save.setFixedSize(88, 32)
+        btn_save.setStyleSheet(
+            "QPushButton { background:#1a3a5c; color:white; border:none; border-radius:4px; font-family:微软雅黑; }"
+            "QPushButton:hover { background:#2a5282; }"
+            "QPushButton:pressed { background:#122540; }"
+        )
+        btn_save.clicked.connect(self._save)
+        btn_row.addWidget(btn_save)
+
+        root.addLayout(btn_row)
+
+    # ------------------------------------------------------------------ #
+    #  数据加载 / 预设                                                       #
+    # ------------------------------------------------------------------ #
+    def _load_from_cfg(self):
+        laser_list = self.cfg.get("lasers", _DEFAULT_LASERS)
+        self.table.setRowCount(0)
+        for item in laser_list:
+            self._add_row(item.get("tab_name", ""), item.get("device_id", ""))
+        self.host_edit.setText(self.cfg.get("tcp_host", DEFAULT_CONFIG["tcp_host"]))
+        self.port_edit.setText(str(self.cfg.get("tcp_port", DEFAULT_CONFIG["tcp_port"])))
+
+    def _load_preset(self, preset: list):
+        self.table.setRowCount(0)
+        for item in preset:
+            self._add_row(item.get("tab_name", ""), item.get("device_id", ""))
+
+    def _add_row(self, tab_name: str = "", device_id: str = ""):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        name_item = QTableWidgetItem(tab_name)
+        id_item   = QTableWidgetItem(device_id)
+        self.table.setItem(row, 0, name_item)
+        self.table.setItem(row, 1, id_item)
+
+        del_btn = QPushButton("删除")
+        del_btn.setStyleSheet(
+            "QPushButton { color:#c0392b; border:none; font-family:微软雅黑; font-size:12px; }"
+            "QPushButton:hover { color:#e74c3c; text-decoration:underline; }"
+        )
+        del_btn.clicked.connect(lambda _, r=row: self._delete_row(del_btn))
+        self.table.setCellWidget(row, 2, del_btn)
+
+    def _delete_row(self, btn: QPushButton):
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, 2) is btn:
+                self.table.removeRow(row)
+                return
+
+    # ------------------------------------------------------------------ #
+    #  保存                                                                 #
+    # ------------------------------------------------------------------ #
+    def _save(self):
+        lasers = []
+        for row in range(self.table.rowCount()):
+            tab_item = self.table.item(row, 0)
+            id_item  = self.table.item(row, 1)
+            tab_name  = tab_item.text().strip() if tab_item else ""
+            device_id = id_item.text().strip()  if id_item  else ""
+            if not tab_name and not device_id:
+                continue
+            if not device_id:
+                device_id = tab_name
+            lasers.append({"tab_name": tab_name, "device_id": device_id})
+
+        if not lasers:
+            QMessageBox.warning(self, "提示", "至少需要配置一台激光器")
+            return
+
+        host = self.host_edit.text().strip()
+        port_text = self.port_edit.text().strip()
+        if not host:
+            QMessageBox.warning(self, "提示", "请填写 TCP 监听地址")
+            return
+        try:
+            port = int(port_text)
+        except ValueError:
+            QMessageBox.warning(self, "提示", "TCP 端口号无效")
+            return
+
+        self.cfg["lasers"]   = lasers
+        self.cfg["tcp_host"] = host
+        self.cfg["tcp_port"] = port
+        save_config(self.cfg)
+        self.accept()
+
+
 # ── 主窗口 ──────────────────────────────────────────────────────────────── #
 class MainWindow(QMainWindow):
 
@@ -713,12 +933,32 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
 
         # ── 标题栏 ────────────────────────────────────────────────────── #
-        title_bar = QLabel("TSL-ITU-B  程控激光器控制")
-        title_bar.setAlignment(Qt.AlignCenter)
-        title_bar.setFixedHeight(48)
-        title_bar.setFont(QFont("微软雅黑", 14, QFont.Bold))
-        title_bar.setStyleSheet("background:#1a3a5c; color:white;")
-        root_layout.addWidget(title_bar)
+        title_widget = QWidget()
+        title_widget.setFixedHeight(48)
+        title_widget.setStyleSheet("background:#1a3a5c;")
+        title_layout = QHBoxLayout(title_widget)
+        title_layout.setContentsMargins(16, 0, 8, 0)
+        title_layout.setSpacing(8)
+
+        title_label = QLabel("TSL-ITU-B  程控激光器控制")
+        title_label.setFont(QFont("微软雅黑", 14, QFont.Bold))
+        title_label.setStyleSheet("color:white; background:transparent;")
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+
+        btn_settings = QPushButton("设置")
+        btn_settings.setFixedSize(80, 30)
+        btn_settings.setFont(QFont("微软雅黑", 10))
+        btn_settings.setStyleSheet(
+            "QPushButton { background:rgba(255,255,255,0.15); color:white;"
+            "  border:1px solid rgba(255,255,255,0.35); border-radius:4px; }"
+            "QPushButton:hover  { background:rgba(255,255,255,0.28); }"
+            "QPushButton:pressed{ background:rgba(255,255,255,0.08); }"
+        )
+        btn_settings.clicked.connect(self._open_config)
+        title_layout.addWidget(btn_settings)
+
+        root_layout.addWidget(title_widget)
 
         # ── 选项卡 ────────────────────────────────────────────────────── #
         self.tab_widget = QTabWidget()
@@ -872,6 +1112,39 @@ class MainWindow(QMainWindow):
         except Exception as e:
             panel._log(f"[TCP] 执行指令 {opcode} 异常: {e}")
             reply(False, error=str(e))
+
+    # ------------------------------------------------------------------ #
+    #  配置对话框                                                            #
+    # ------------------------------------------------------------------ #
+    def _open_config(self):
+        dlg = ConfigDialog(self.cfg, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._apply_config()
+
+    def _apply_config(self):
+        """断开所有设备，根据当前 cfg 重建激光器面板"""
+        for panel in self.panels.values():
+            panel._disconnect()
+
+        while self.tab_widget.count():
+            self.tab_widget.removeTab(0)
+        self.panels.clear()
+
+        laser_list = self.cfg.get("lasers", _DEFAULT_LASERS)
+        for idx, laser_cfg in enumerate(laser_list):
+            tab_name     = laser_cfg.get("tab_name",     f"激光器 {idx + 1}")
+            device_id    = laser_cfg.get("device_id",    tab_name)
+            port_cfg_key = laser_cfg.get("port_cfg_key", f"last_port_{device_id}")
+            panel = LaserPanel(
+                label=tab_name,
+                wl_list=self.wl_list,
+                wl_table=self.wl_table,
+                chn_to_wl=self.chn_to_wl,
+                port_cfg_key=port_cfg_key,
+                cfg=self.cfg,
+            )
+            self.panels[device_id.upper()] = panel
+            self.tab_widget.addTab(panel, tab_name)
 
     def closeEvent(self, event):
         for panel in self.panels.values():
