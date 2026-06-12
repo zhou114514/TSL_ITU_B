@@ -157,7 +157,7 @@ class ScrollableComboBox(QComboBox):
 class LaserPanel(QWidget):
     """封装单台激光器的串口连接、状态显示、波长/功率/输出控制及操作日志"""
 
-    QUICK_WL = ["1540.56", "1563.05"]
+    QUICK_WL = ["1540.56", "1550.12", "1563.05"]
 
     def __init__(
         self,
@@ -562,6 +562,30 @@ class LaserPanel(QWidget):
         if packet and self.device and self.device.check_data(packet):
             return packet[3:5] == b"\x01\x01"
         return None
+
+    def cmd_and_wait(self, cmd_fn, addr: int, timeout: float = 3.0) -> bool:
+        """发送写指令并等待监听线程捕获硬件应答，线程安全。
+
+        利用已有的 _query_lock 保证同一设备的串口操作串行化：
+        持锁期间监听线程仍在读串口，一旦收到与 addr 匹配的应答包
+        即通过 _pending_event 通知本方法返回。
+        """
+        if self.device is None:
+            return False
+        with self._query_lock:
+            self._pending_event.clear()
+            self._pending_result = None
+            self._pending_addr = addr
+            try:
+                cmd_fn()
+            except Exception:
+                self._pending_addr = None
+                self._pending_result = None
+                return False
+            got = self._pending_event.wait(timeout=timeout)
+            self._pending_addr = None
+            self._pending_result = None
+        return got
 
     # ------------------------------------------------------------------ #
     #  波长控制                                                             #
@@ -993,8 +1017,9 @@ class MainWindow(QMainWindow):
     def _on_tcp_message(self, client_socket, message: str):
         """
         处理远程控制 TCP 消息。
-        所有指令均可携带 "device" 字段（"Transmitter" / "CCD"）以指定目标设备。
-        不携带时默认路由到发射端。
+        所有指令均可携带 "device" 字段以指定目标设备。
+        LaserON / LaserOFF 支持 "device": "ALL" 同时控制所有已连接激光器。
+        不携带时默认路由到第一台激光器。
         """
         def reply(ok: bool, value=None, error: str = "Null"):
             self.server.back_signal.emit(
@@ -1018,8 +1043,9 @@ class MainWindow(QMainWindow):
 
         # 根据 device 字段路由到对应面板；未指定时默认路由到第一台激光器
         panel = self.panels.get(device_field) or next(iter(self.panels.values()))
-
-        panel._log(f"[TCP] 收到指令: {opcode}  (device={device_field or next(iter(self.panels))})")
+        device_log = device_field or next(iter(self.panels))
+        log_panel = next(iter(self.panels.values()))
+        log_panel._log(f"[TCP] 收到指令: {opcode}  (device={device_log})")
 
         try:
             # ── 9.1 连接设备 ──────────────────────────────────────────── #
@@ -1035,21 +1061,85 @@ class MainWindow(QMainWindow):
 
             # ── 8.1 开激光器 ──────────────────────────────────────────── #
             elif opcode == "LaserON":
-                if panel.device is None:
-                    reply(False, error=f"{panel.label} 未连接")
-                    return
-                panel.device.cmd_output(True)
-                panel._log(f"[TCP] LaserON 执行成功")
-                reply(True)
+                if device_field == "ALL":
+                    panels_snap = list(self.panels.values())
+                    if not any(p.device for p in panels_snap):
+                        reply(False, error="没有已连接的激光器")
+                        return
+                    def _do_all_on(panels=panels_snap):
+                        operated, failed = 0, []
+                        for p in panels:
+                            if p.device is None:
+                                p._log(f"[TCP] LaserON 跳过: {p.label} 未连接")
+                                continue
+                            ok = p.cmd_and_wait(lambda dev=p.device: dev.cmd_output(True), OUTPUT_ADDR)
+                            if ok:
+                                p._log("[TCP] LaserON 执行成功")
+                                operated += 1
+                            else:
+                                p._log(f"[TCP] LaserON 硬件应答超时: {p.label}")
+                                failed.append(p.label)
+                        if operated == 0:
+                            reply(False, error="所有设备均未收到硬件应答")
+                        elif failed:
+                            reply(False, error=f"部分设备应答超时: {failed}")
+                        else:
+                            reply(True)
+                    threading.Thread(target=_do_all_on, daemon=True).start()
+                else:
+                    if panel.device is None:
+                        reply(False, error=f"{panel.label} 未连接")
+                        return
+                    def _do_on(p=panel):
+                        ok = p.cmd_and_wait(lambda: p.device.cmd_output(True), OUTPUT_ADDR)
+                        if ok:
+                            p._log("[TCP] LaserON 执行成功")
+                            reply(True)
+                        else:
+                            p._log("[TCP] LaserON 硬件应答超时")
+                            reply(False, error="硬件应答超时")
+                    threading.Thread(target=_do_on, daemon=True).start()
 
             # ── 8.2 关激光器 ──────────────────────────────────────────── #
             elif opcode == "LaserOFF":
-                if panel.device is None:
-                    reply(False, error=f"{panel.label} 未连接")
-                    return
-                panel.device.cmd_output(False)
-                panel._log(f"[TCP] LaserOFF 执行成功")
-                reply(True)
+                if device_field == "ALL":
+                    panels_snap = list(self.panels.values())
+                    if not any(p.device for p in panels_snap):
+                        reply(False, error="没有已连接的激光器")
+                        return
+                    def _do_all_off(panels=panels_snap):
+                        operated, failed = 0, []
+                        for p in panels:
+                            if p.device is None:
+                                p._log(f"[TCP] LaserOFF 跳过: {p.label} 未连接")
+                                continue
+                            ok = p.cmd_and_wait(lambda dev=p.device: dev.cmd_output(False), OUTPUT_ADDR)
+                            if ok:
+                                p._log("[TCP] LaserOFF 执行成功")
+                                operated += 1
+                            else:
+                                p._log(f"[TCP] LaserOFF 硬件应答超时: {p.label}")
+                                failed.append(p.label)
+                        if operated == 0:
+                            reply(False, error="所有设备均未收到硬件应答")
+                        elif failed:
+                            reply(False, error=f"部分设备应答超时: {failed}")
+                        else:
+                            reply(True)
+                    threading.Thread(target=_do_all_off, daemon=True).start()
+                else:
+                    if panel.device is None:
+                        reply(False, error=f"{panel.label} 未连接")
+                        return
+                    def _do_off(p=panel):
+                        ok = p.cmd_and_wait(lambda: p.device.cmd_output(False), OUTPUT_ADDR)
+                        if ok:
+                            p._log("[TCP] LaserOFF 执行成功")
+                            reply(True)
+                        else:
+                            p._log("[TCP] LaserOFF 硬件应答超时")
+                            reply(False, error="硬件应答超时")
+                    threading.Thread(target=_do_off, daemon=True).start()
 
             # ── 8.3 调整波长 ──────────────────────────────────────────── #
             elif opcode == "SetWavelength":
@@ -1059,6 +1149,8 @@ class MainWindow(QMainWindow):
                 wl = str(parameter.get("Wavelength", "")).strip() if isinstance(parameter, dict) else ""
                 if wl == "1540":
                     wl = "1540.56"
+                elif wl == "1550":
+                    wl = "1550.12"
                 elif wl == "1563":
                     wl = "1563.05"
                 if not wl:
@@ -1068,9 +1160,15 @@ class MainWindow(QMainWindow):
                 if chn is None:
                     reply(False, error=f"未找到波长 {wl} 对应的通道号")
                     return
-                panel.device.cmd_channel(chn)
-                panel._log(f"[TCP] SetWavelength {wl} nm (通道 {chn}) 执行成功")
-                reply(True)
+                def _do_wl(p=panel, ch=chn, wavelength=wl):
+                    ok = p.cmd_and_wait(lambda: p.device.cmd_channel(ch), CHANNEL_ADDR)
+                    if ok:
+                        p._log(f"[TCP] SetWavelength {wavelength} nm (通道 {ch}) 执行成功")
+                        reply(True)
+                    else:
+                        p._log(f"[TCP] SetWavelength {wavelength} nm 硬件应答超时")
+                        reply(False, error="硬件应答超时")
+                threading.Thread(target=_do_wl, daemon=True).start()
 
             # ── 8.4 获取波长 ──────────────────────────────────────────── #
             elif opcode == "GetWavelength":
