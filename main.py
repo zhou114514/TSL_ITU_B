@@ -716,8 +716,8 @@ class ConfigDialog(QDialog):
     PRESET_REAR_OPTICAL = [
         {"tab_name": "发射A", "device_id": "A"},
         {"tab_name": "发射B", "device_id": "B"},
-        {"tab_name": "基准镜", "device_id": "JZJ"},
-        {"tab_name": "接收",   "device_id": "CCD"},
+        {"tab_name": "接收", "device_id": "JZJ"},
+        {"tab_name": "基准镜",   "device_id": "CCD"},
     ]
 
     def __init__(self, cfg: dict, parent=None):
