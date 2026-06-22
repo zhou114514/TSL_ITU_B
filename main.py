@@ -1032,6 +1032,30 @@ class MainWindow(QMainWindow):
             reply(False, error=f"JSON解析错误: {e}")
             return
 
+        def safeOFF(panel: LaserPanel) -> bool:
+            """
+            安全关闭激光器：先发送关光指令，再重复开关光两次，确保激光器真正关闭。
+            激光器在关闭时有概率返回包提示已关闭但激光依然存在，重复开关光可规避该问题。
+            返回 True 表示初次关光成功并完成补偿操作，返回 False 表示初次关光应答超时。
+            """
+            ok = panel.cmd_and_wait(lambda: panel.device.cmd_output(False), OUTPUT_ADDR)
+            if not ok:
+                panel._log(f"[TCP] safeOFF 初次关光硬件应答超时: {panel.label}")
+                return False
+            panel._log(f"[TCP] safeOFF 初次关光成功: {panel.label}，开始补偿开关光")
+            time.sleep(0.5)
+            for i in range(1, 3):
+                ok_on = panel.cmd_and_wait(lambda dev=panel.device: dev.cmd_output(True), OUTPUT_ADDR)
+                if not ok_on:
+                    panel._log(f"[TCP] safeOFF 第{i}次补偿开光应答超时: {panel.label}")
+                time.sleep(0.5)
+                ok_off = panel.cmd_and_wait(lambda dev=panel.device: dev.cmd_output(False), OUTPUT_ADDR)
+                if not ok_off:
+                    panel._log(f"[TCP] safeOFF 第{i}次补偿关光应答超时: {panel.label}")
+                time.sleep(0.5)
+            panel._log(f"[TCP] safeOFF 安全关光完成: {panel.label}")
+            return True
+
         opcode    = data.get("opcode", "")
         parameter = data.get("parameter", "")
 
@@ -1113,17 +1137,17 @@ class MainWindow(QMainWindow):
                             if p.device is None:
                                 p._log(f"[TCP] LaserOFF 跳过: {p.label} 未连接")
                                 continue
-                            ok = p.cmd_and_wait(lambda dev=p.device: dev.cmd_output(False), OUTPUT_ADDR)
+                            ok = safeOFF(p)
                             if ok:
-                                p._log("[TCP] LaserOFF 执行成功")
+                                p._log(f"[TCP] LaserOFF 安全关光成功: {p.label}")
                                 operated += 1
                             else:
-                                p._log(f"[TCP] LaserOFF 硬件应答超时: {p.label}")
+                                p._log(f"[TCP] LaserOFF 安全关光失败: {p.label}")
                                 failed.append(p.label)
                         if operated == 0:
                             reply(False, error="所有设备均未收到硬件应答")
                         elif failed:
-                            reply(False, error=f"部分设备应答超时: {failed}")
+                            reply(False, error=f"部分设备安全关光失败: {failed}")
                         else:
                             reply(True)
                     threading.Thread(target=_do_all_off, daemon=True).start()
@@ -1132,13 +1156,13 @@ class MainWindow(QMainWindow):
                         reply(False, error=f"{panel.label} 未连接")
                         return
                     def _do_off(p=panel):
-                        ok = p.cmd_and_wait(lambda: p.device.cmd_output(False), OUTPUT_ADDR)
+                        ok = safeOFF(p)
                         if ok:
-                            p._log("[TCP] LaserOFF 执行成功")
+                            p._log("[TCP] LaserOFF 安全关光成功")
                             reply(True)
                         else:
-                            p._log("[TCP] LaserOFF 硬件应答超时")
-                            reply(False, error="硬件应答超时")
+                            p._log("[TCP] LaserOFF 安全关光失败")
+                            reply(False, error="激光器安全关闭失败，初次关光硬件应答超时")
                     threading.Thread(target=_do_off, daemon=True).start()
 
             # ── 8.3 调整波长 ──────────────────────────────────────────── #
